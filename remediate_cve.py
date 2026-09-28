@@ -1,0 +1,1119 @@
+#!/usr/bin/env python3
+"""
+Remediate Go CVE across multiple branches.
+
+Handles:
+- Repository setup and branch management
+- Go version compatibility checks
+- Fork lookup and selection
+- Fix application (go get or go mod replace)
+- Git commits
+"""
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+import yaml
+from pathlib import Path
+
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def run(cmd, cwd=None):
+    """Execute shell command and return (success, stdout, stderr)."""
+    result = subprocess.run(
+        cmd, shell=True, cwd=cwd, capture_output=True, text=True
+    )
+    return result.returncode == 0, result.stdout.strip(), result.stderr.strip()
+
+
+def compare_versions(v1, v2):
+    """
+    Compare Go versions (major.minor only).
+    Returns: -1 if v1 < v2, 0 if equal, 1 if v1 > v2
+    """
+    def parse(v):
+        parts = v.split(".")
+        return (int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
+
+    p1 = parse(v1)
+    p2 = parse(v2)
+
+    if p1 < p2:
+        return -1
+    elif p1 > p2:
+        return 1
+    return 0
+
+
+# ============================================================================
+# GIT OPERATIONS
+# ============================================================================
+
+def validate_git_remotes(repo_path):
+    """Ensure upstream and origin remotes are configured."""
+    success, stdout, stderr = run("git remote -v", repo_path)
+    if not success:
+        return False, f"git remote failed: {stderr}"
+
+    remotes = stdout.lower()
+    if "upstream" not in remotes:
+        return False, "Missing 'upstream' remote (should point to openshift repo)"
+    if "origin" not in remotes:
+        return False, "Missing 'origin' remote (should point to user fork)"
+
+    return True, None
+
+
+def fetch_upstream(repo_path):
+    """Fetch latest changes from upstream."""
+    success, _, stderr = run("git fetch upstream", repo_path)
+    if not success:
+        return False, f"git fetch upstream failed: {stderr}"
+    return True, None
+
+
+def checkout_and_pull_branch(repo_path, branch):
+    """Checkout branch and pull latest from upstream."""
+    # Try to checkout existing branch
+    success, _, _ = run(f"git checkout {branch}", repo_path)
+    if not success:
+        # Create tracking branch if it doesn't exist
+        success, _, stderr = run(
+            f"git checkout -b {branch} --track upstream/{branch}", repo_path
+        )
+        if not success:
+            return False, f"Failed to create tracking branch: {stderr}"
+
+    # Pull latest from upstream
+    success, _, stderr = run(f"git pull upstream {branch}", repo_path)
+    if not success:
+        return False, f"git pull failed: {stderr}"
+
+    return True, None
+
+
+def branch_exists(repo_path, branch_name):
+    """Check if a branch exists locally."""
+    success, stdout, _ = run("git branch --list", repo_path)
+    if not success:
+        return False
+
+    # Parse branch list (format: "  branch-name" or "* current-branch")
+    branches = [line.strip().lstrip('* ').strip() for line in stdout.split('\n')]
+    return branch_name in branches
+
+
+def create_working_branch(repo_path, base_working_branch):
+    """
+    Create a unique working branch for changes.
+
+    If base_working_branch already exists, appends a numeric suffix
+    to create a unique name (e.g., net-4.16-1, net-4.16-2, etc.)
+
+    Returns: (success, working_branch_name, error)
+    """
+    working_branch = base_working_branch
+    suffix = 1
+
+    # Find a unique branch name
+    while branch_exists(repo_path, working_branch):
+        print(f"[debug] Branch '{working_branch}' already exists, trying with suffix", file=sys.stderr)
+        working_branch = f"{base_working_branch}-{suffix}"
+        suffix += 1
+
+        # Safety limit to prevent infinite loops
+        if suffix > 100:
+            return False, None, f"Could not create unique branch name after 100 attempts (base: {base_working_branch})"
+
+    # Create the branch
+    success, _, stderr = run(f"git checkout -b {working_branch}", repo_path)
+    if not success:
+        return False, None, f"Failed to create working branch '{working_branch}': {stderr}"
+
+    print(f"[debug] Created working branch: {working_branch}", file=sys.stderr)
+    return True, working_branch, None
+
+
+def commit_changes(repo_path, commit_message, has_vendor):
+    """Stage and commit changes to go.mod, go.sum, and vendor/."""
+    # Check what changed before staging
+    success, diff_output, _ = run("git diff --name-only", repo_path)
+    print(f"[debug] Files changed before staging: {diff_output}", file=sys.stderr)
+
+    # Stage files
+    run("git add go.mod go.sum", repo_path)
+    if has_vendor:
+        run("git add vendor/", repo_path)
+
+    # Check what's staged
+    success, status_output, _ = run("git status --porcelain", repo_path)
+    print(f"[debug] Git status after staging: {status_output}", file=sys.stderr)
+
+    # Check if anything is staged
+    if not status_output.strip():
+        return None, "No changes to commit (files unchanged after go mod operations)"
+
+    # Commit with sign-off
+    success, stdout, stderr = run(f'git commit -s -m "{commit_message}"', repo_path)
+    if not success:
+        # Capture more context
+        _, config_name, _ = run("git config user.name", repo_path)
+        _, config_email, _ = run("git config user.email", repo_path)
+        return None, f"git commit failed: {stderr or stdout} (user.name={config_name}, user.email={config_email})"
+
+    # Get commit hash
+    success, stdout, _ = run("git log --oneline -1", repo_path)
+    if success:
+        return stdout.split()[0], None
+
+    return None, "Failed to get commit hash"
+
+
+# ============================================================================
+# GO VERSION MANAGEMENT
+# ============================================================================
+
+def extract_go_version_from_ci_operator(repo_path):
+    """
+    Extract Go version from .ci-operator.yaml file.
+
+    Parses build_root_image.tag to extract Go version.
+    Example: "rhel-9-release-golang-1.24-openshift-4.21" -> "1.24"
+
+    Returns: (go_version, None) on success or (None, error_msg) on failure
+    """
+    ci_operator_file = repo_path / ".ci-operator.yaml"
+
+    if not ci_operator_file.exists():
+        return None, ".ci-operator.yaml not found"
+
+    try:
+        with open(ci_operator_file) as f:
+            config = yaml.safe_load(f)
+
+        # Navigate to build_root_image.tag
+        tag = config.get("build_root_image", {}).get("tag", "")
+
+        if not tag:
+            return None, "build_root_image.tag not found in .ci-operator.yaml"
+
+        # Extract Go version from tag (e.g., "golang-1.24" -> "1.24")
+        # Pattern: golang-X.Y or golang-X.Y.Z
+        match = re.search(r'golang-(\d+\.\d+(?:\.\d+)?)', tag)
+
+        if match:
+            go_version = match.group(1)
+            return go_version, None
+
+        return None, f"Could not extract Go version from tag: {tag}"
+
+    except yaml.YAMLError as e:
+        return None, f"Failed to parse .ci-operator.yaml: {e}"
+    except Exception as e:
+        return None, f"Error reading .ci-operator.yaml: {e}"
+
+
+def extract_go_version_from_go_mod(repo_path):
+    """Read Go version from go.mod file (fallback method)."""
+    go_mod = repo_path / "go.mod"
+    if not go_mod.exists():
+        return None, "go.mod not found"
+
+    with open(go_mod) as f:
+        for line in f:
+            if line.startswith("go "):
+                return line.split()[1].strip(), None
+
+    return None, "go version directive not found in go.mod"
+
+
+def detect_repo_go_version(repo_path):
+    """
+    Detect repository's Go version with fallback strategy:
+    1. Try .ci-operator.yaml (CI build configuration - authoritative)
+    2. Fall back to go.mod (language directive)
+
+    Returns: (go_version, source) where source is "ci-operator" or "go.mod"
+    Raises: error if neither source yields a valid version
+    """
+    # Try CI operator config first (preferred)
+    go_version, error = extract_go_version_from_ci_operator(repo_path)
+    if go_version:
+        return go_version, "ci-operator"
+
+    # Fall back to go.mod
+    go_version, go_mod_error = extract_go_version_from_go_mod(repo_path)
+    if go_version:
+        return go_version, "go.mod"
+
+    # Both methods failed
+    return None, f"Failed to detect Go version. CI operator: {error}. go.mod: {go_mod_error}"
+
+
+def fetch_go_requirement_for_module(module, version):
+    """Fetch Go version required by a specific module@version."""
+    url = f"https://proxy.golang.org/{module}/@v/{version}.mod"
+    success, stdout, _ = run(f'curl -s "{url}"')
+
+    if not success or not stdout:
+        return None, f"Failed to fetch go.mod for {module}@{version}"
+
+    for line in stdout.split("\n"):
+        if line.startswith("go "):
+            return line.split()[1].strip(), None
+
+    return None, f"go version directive not found in {module}@{version}"
+
+
+def ensure_go_version_installed(version):
+    """Install Go version via goenv if not already installed."""
+    # Check if already installed
+    success, stdout, _ = run("goenv versions")
+    if success and version in stdout:
+        return True, None
+
+    # Install
+    success, _, stderr = run(f"goenv install {version}")
+    if not success:
+        return False, f"goenv install failed: {stderr}"
+
+    return True, None
+
+
+def set_repo_go_version(repo_path, version):
+    """Set local Go version for repository."""
+    success, _, stderr = run(f"goenv local {version}", repo_path)
+    if not success:
+        return False, f"goenv local failed: {stderr}"
+    return True, None
+
+
+def get_goenv_go_bin(repo_path):
+    """
+    Return the absolute path to the go binary for the version set by goenv in repo_path.
+
+    Uses 'goenv which go' with cwd=repo_path so it reads the .go-version file we
+    just wrote there. This bypasses PATH ordering, which matters when GVM or another
+    version manager shadows goenv's shims.
+    """
+    success, stdout, stderr = run("goenv which go", repo_path)
+    if not success or not stdout:
+        return None, f"goenv which go failed: {stderr}"
+    return stdout.strip(), None
+
+
+# ============================================================================
+# FORK OPERATIONS
+# ============================================================================
+
+def derive_fork_name(module):
+    """Extract fork repository name from module path (last segment)."""
+    return module.split("/")[-1]
+
+
+def check_if_fork_exists(fork_name):
+    """Check if openshift-sustaining fork repository exists on GitHub."""
+    url = f"https://api.github.com/repos/openshift-sustaining/{fork_name}"
+    success, stdout, _ = run(f'curl -s -o /dev/null -w "%{{http_code}}" "{url}"')
+
+    if success and stdout == "200":
+        return True, None
+    elif success and stdout == "404":
+        return False, "Fork repository does not exist"
+    else:
+        return False, f"Failed to check fork (HTTP {stdout})"
+
+
+def extract_go_version_from_name(name):
+    """
+    Extract Go version from fork release name by searching for go version pattern.
+    E.g., 'Security fix for CVE-2025-1234 with go1.21' -> '1.21'
+         'v0.8.0 built with go1.22' -> '1.22'
+         'Release go1.23.5 CVE fixes' -> '1.23.5'
+         'v0.50.0-sec.2 fixes CVE-2026-25681 for Go v1.24' -> '1.24'
+    Returns Go version string or None if not found.
+    """
+    if not name:
+        return None
+
+    # Match go1.21, go1.22.3, "Go v1.24", "Go 1.24"
+    match = re.search(r'go\s*v?(\d+\.\d+(?:\.\d+)?)', name, re.IGNORECASE)
+    if match:
+        return match.group(1)  # Returns just the version number (e.g., "1.21")
+
+    return None
+
+
+def find_best_fork_release(fork_name, cve_ids, fix_version, repo_go_version):
+    """
+    Find the best fork release that:
+    1. Cumulatively covers ALL CVE IDs (releases are cumulative - newer includes older fixes)
+    2. Matches the repo's Go version or falls back to older Go versions
+    3. Returns the earliest release that has all fixes
+
+    Logic:
+    - Each release typically fixes ONE CVE
+    - If we need CVE-1 and CVE-2:
+      - v0.43.0-sec1-go1.24 has CVE-1
+      - v0.43.0-sec2-go1.24 has CVE-2
+      - Choose v0.43.0-sec2-go1.24 (includes both cumulatively)
+    - Go version fallback: 1.24 → 1.23 → 1.22 (backward, not forward)
+
+    Returns (tag, None) on success or (None, error) on failure.
+    """
+    url = f"https://api.github.com/repos/openshift-sustaining/{fork_name}/releases?per_page=100"
+    success, stdout, stderr = run(f'curl -s "{url}"')
+
+    if not success:
+        return None, f"Failed to fetch fork releases: {stderr}"
+
+    try:
+        releases = json.loads(stdout)
+    except json.JSONDecodeError as e:
+        return None, f"Failed to parse releases JSON: {e}"
+
+    if not releases or not isinstance(releases, list):
+        return None, "No releases found for fork"
+
+    # Parse repo's Go version to major.minor (e.g., "1.21" from "1.21.5")
+    repo_go_parts = repo_go_version.split(".")[:2]
+    repo_go_major_minor = ".".join(repo_go_parts)
+
+    # Build release data with CVE tracking
+    # Structure: {go_version: [{"tag": "...", "name": "...", "published_at": "...", "cves_fixed": [...]}, ...]}
+    releases_by_go_version = {}
+
+    print(
+        f"[debug] find_best_fork_release: fork={fork_name} "
+        f"cve_ids={cve_ids} repo_go={repo_go_major_minor} "
+        f"releases_fetched={len(releases)}",
+        file=sys.stderr,
+    )
+
+    skipped_no_go = 0
+    skipped_no_cve = 0
+    matched = 0
+
+    for release in releases:
+        tag = release.get("tag_name", "")
+        name = release.get("name", "")
+        published_at = release.get("published_at", "")
+
+        # Extract Go version from name
+        go_version = extract_go_version_from_name(name)
+        if not go_version:
+            skipped_no_go += 1
+            print(
+                f"[debug] skip (no go version in name): tag={tag!r} name={name!r}",
+                file=sys.stderr,
+            )
+            continue
+
+        # Normalize to major.minor
+        go_version_parts = go_version.split(".")[:2]
+        go_version_normalized = ".".join(go_version_parts)
+
+        # Find which CVEs this release fixes (only check name field)
+        # Normalize both CVE ID and name to handle "CVE-2026-39829" vs "CVE 2026 39829"
+        cves_in_release = []
+        name_normalized = name.replace("-", " ").replace("  ", " ")
+        for cve in cve_ids:
+            cve_normalized = cve.replace("-", " ")
+            if cve_normalized in name_normalized:
+                cves_in_release.append(cve)
+
+        # Skip if this release doesn't fix any of our target CVEs
+        if not cves_in_release:
+            skipped_no_cve += 1
+            # Also check tag to hint if CVE is only in tag_name
+            tag_normalized = tag.replace("-", " ").replace("  ", " ")
+            cves_in_tag = [cve for cve in cve_ids if cve.replace("-", " ") in tag_normalized]
+            print(
+                f"[debug] skip (no target CVE in name): tag={tag!r} name={name!r} "
+                f"go={go_version_normalized} cves_in_tag={cves_in_tag}",
+                file=sys.stderr,
+            )
+            continue
+
+        # Add to releases grouped by Go version
+        if go_version_normalized not in releases_by_go_version:
+            releases_by_go_version[go_version_normalized] = []
+
+        releases_by_go_version[go_version_normalized].append({
+            "tag": tag,
+            "name": name,
+            "published_at": published_at,
+            "cves_fixed": cves_in_release
+        })
+        matched += 1
+        print(
+            f"[debug] match: tag={tag!r} name={name!r} "
+            f"go={go_version_normalized} cves_fixed={cves_in_release}",
+            file=sys.stderr,
+        )
+
+    print(
+        f"[debug] summary: matched={matched} skipped_no_go={skipped_no_go} "
+        f"skipped_no_cve={skipped_no_cve} "
+        f"go_versions={sorted(releases_by_go_version.keys())}",
+        file=sys.stderr,
+    )
+
+    if not releases_by_go_version:
+        return None, f"No fork releases found fixing any of: {', '.join(cve_ids)}"
+
+    # Sort releases within each Go version by published date (oldest first)
+    # This gives us chronological order for cumulative fix tracking
+    for go_ver in releases_by_go_version:
+        releases_by_go_version[go_ver].sort(key=lambda x: x["published_at"])
+
+    # Try Go versions in descending order: exact match first, then backward (1.24 → 1.23 → 1.22)
+    available_versions = sorted(
+        releases_by_go_version.keys(),
+        key=lambda v: [int(x) for x in v.split(".")],
+        reverse=True  # Descending order
+    )
+
+    repo_version_tuple = tuple(int(x) for x in repo_go_parts)
+
+    # Build candidate list: exact match + older versions
+    candidate_go_versions = []
+    for go_ver in available_versions:
+        ver_tuple = tuple(int(x) for x in go_ver.split("."))
+        if ver_tuple <= repo_version_tuple:  # Same or older
+            candidate_go_versions.append(go_ver)
+
+    if not candidate_go_versions:
+        return None, f"No fork releases found for Go {repo_go_major_minor} or older"
+
+    # For each Go version candidate, find earliest release with all CVE fixes (cumulative)
+    for go_ver in candidate_go_versions:
+        releases = releases_by_go_version[go_ver]
+
+        # Track cumulative CVE fixes
+        cumulative_cves = set()
+
+        for rel in releases:
+            # Add CVEs fixed by this release
+            cumulative_cves.update(rel["cves_fixed"])
+
+            # Check if we have all required CVEs
+            if all(cve in cumulative_cves for cve in cve_ids):
+                # Found the earliest release with all fixes for this Go version
+                return rel["tag"], None
+
+    # No release found with all CVE fixes
+    return None, f"No fork release found covering all CVE IDs: {', '.join(cve_ids)}"
+
+
+def fetch_fork_go_requirement(fork_name, fork_version):
+    """Get Go version required by fork@version."""
+    # Try module proxy first
+    url = f"https://proxy.golang.org/github.com/openshift-sustaining/{fork_name}/@v/{fork_version}.mod"
+    success, stdout, _ = run(f'curl -s "{url}"')
+
+    if not success or not stdout:
+        # Fallback to raw GitHub
+        url = f"https://raw.githubusercontent.com/openshift-sustaining/{fork_name}/{fork_version}/go.mod"
+        success, stdout, _ = run(f'curl -s "{url}"')
+        if not success:
+            return None, f"Failed to fetch fork go.mod"
+
+    for line in stdout.split("\n"):
+        if line.startswith("go "):
+            return line.split()[1].strip(), None
+
+    return None, f"go version not found in fork go.mod"
+
+
+# ============================================================================
+# COMPATIBILITY DETERMINATION
+# ============================================================================
+
+def determine_branch_compatibility(repo_go_version, fix_go_required, fork_info):
+    """
+    Determine if branch can use direct fix, fork, or is blocked.
+
+    Returns: (status, details_dict)
+    - status: "COMPATIBLE" | "FORK_AVAILABLE" | "BLOCKED"
+    - details: method, version, reason, etc.
+    """
+    comparison = compare_versions(fix_go_required, repo_go_version)
+
+    if comparison <= 0:
+        # Fix is compatible with repo's Go version
+        return "COMPATIBLE", {
+            "method": "get",
+            "reason": f"Fix requires Go {fix_go_required}, repo has {repo_go_version}"
+        }
+
+    # Fix requires newer Go version, need fork
+    if not fork_info or not fork_info.get("version"):
+        return "BLOCKED", {
+            "method": None,
+            "reason": f"Fix requires Go {fix_go_required}, repo has {repo_go_version}, no fork available"
+        }
+
+    # Fork exists, check its Go requirement
+    fork_go = fork_info["go_required"]
+    fork_comparison = compare_versions(fork_go, repo_go_version)
+
+    if fork_comparison <= 0:
+        return "FORK_AVAILABLE", {
+            "method": "replace",
+            "fork_version": fork_info["version"],
+            "reason": f"Fork requires Go {fork_go}, repo has {repo_go_version}"
+        }
+    else:
+        return "BLOCKED", {
+            "method": None,
+            "reason": f"Fork requires Go {fork_go}, repo has {repo_go_version}"
+        }
+
+
+# ============================================================================
+# FIX APPLICATION
+# ============================================================================
+
+def apply_go_get(repo_path, module, version, go_bin):
+    """Apply fix using go get."""
+    success, _, stderr = run(f"{go_bin} get {module}@{version}", repo_path)
+    if not success:
+        return False, f"go get failed: {stderr}"
+    return True, None
+
+
+def apply_go_replace(repo_path, module, fork_name, fork_version):
+    """Apply fix using go mod edit -replace."""
+    replacement = f"github.com/openshift-sustaining/{fork_name}@{fork_version}"
+    success, _, stderr = run(f"go mod edit -replace {module}={replacement}", repo_path)
+    if not success:
+        return False, f"go mod edit failed: {stderr}"
+    return True, None
+
+
+def run_go_tidy_and_vendor(repo_path, go_bin):
+    """Run go mod tidy and go mod vendor (if vendor/ exists)."""
+    # Tidy
+    success, _, stderr = run(f"{go_bin} mod tidy", repo_path)
+    if not success:
+        return False, False, f"go mod tidy failed: {stderr}"
+
+    # Vendor (if directory exists)
+    has_vendor = (repo_path / "vendor").exists()
+    if has_vendor:
+        success, _, stderr = run(f"{go_bin} mod vendor", repo_path)
+        if not success:
+            return False, has_vendor, f"go mod vendor failed: {stderr}"
+
+    return True, has_vendor, None
+
+
+def build_commit_message(module, version, cve_ids, method, fork_name=None, ocpbugs=None):
+    """
+    Build commit message based on fix method.
+
+    If ocpbugs is provided, prefixes message with JIRA ticket IDs:
+    "OCPBUGS-12345,OCPBUGS-67890: <message>"
+    """
+    cve_list = ", ".join(cve_ids)
+
+    if method == "get":
+        msg = f"Bump {module} to {version} to address {cve_list}"
+    elif method == "replace":
+        fork_path = f"github.com/openshift-sustaining/{fork_name}@{version}"
+        msg = f"Replace {module} with {fork_path} to address {cve_list}"
+    else:
+        msg = f"Apply CVE fix for {cve_list}"
+
+    # Prefix with OCPBUGS IDs if provided
+    if ocpbugs:
+        bug_prefix = ",".join(ocpbugs)
+        return f"{bug_prefix}: {msg}"
+
+    return msg
+
+
+# ============================================================================
+# BRANCH SETUP
+# ============================================================================
+
+def derive_working_branch_name(module, branch):
+    """Generate working branch name from module and release branch."""
+    vulnpkg = module.split("/")[-1]
+
+    if branch.startswith("release-"):
+        branch_version = branch.replace("release-", "")
+    else:
+        branch_version = branch
+
+    return f"{vulnpkg}-{branch_version}"
+
+
+def setup_branch_and_go_environment(repo_path, branch, module):
+    """
+    Setup a single branch and configure Go environment:
+    - Checkout and pull branch
+    - Create working branch
+    - Detect Go version (from .ci-operator.yaml or go.mod)
+    - Install Go version via goenv
+    - Set local Go version for repo
+
+    Returns: (branch_data, error)
+    """
+    # Checkout and pull branch
+    success, error = checkout_and_pull_branch(repo_path, branch)
+    if not success:
+        return None, error
+
+    # Create working branch (with unique name if needed)
+    base_working_branch = derive_working_branch_name(module, branch)
+    success, working_branch, error = create_working_branch(repo_path, base_working_branch)
+    if not success:
+        return None, error
+
+    # Detect repo's Go version (try .ci-operator.yaml first, then go.mod)
+    result = detect_repo_go_version(repo_path)
+    if isinstance(result, tuple) and len(result) == 2 and result[0]:
+        go_version, source = result
+        print(f"[debug] Go version detected from {source}: {go_version}", file=sys.stderr)
+    else:
+        # Error case
+        error = result if isinstance(result, str) else "Unknown error detecting Go version"
+        return None, error
+
+    # Install and set Go version
+    success, error = ensure_go_version_installed(go_version)
+    if not success:
+        return None, error
+
+    success, error = set_repo_go_version(repo_path, go_version)
+    if not success:
+        return None, error
+
+    # Resolve the absolute go binary path via goenv (cwd=repo_path so it reads
+    # the .go-version we just wrote there). This bypasses PATH ordering issues
+    # when GVM or another version manager shadows goenv's shims.
+    go_bin, error = get_goenv_go_bin(repo_path)
+    if not go_bin:
+        return None, error
+    print(f"[debug] Resolved go binary: {go_bin}", file=sys.stderr)
+
+    return {
+        "branch": branch,
+        "working_branch": working_branch,
+        "repo_go_version": go_version,
+        "go_version_source": source,
+        "go_bin": go_bin,
+    }, None
+
+
+# ============================================================================
+# MAIN ORCHESTRATION
+# ============================================================================
+
+def parse_arguments():
+    """Parse and validate command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Remediate Go CVE(s) across one or more branches with automatic fork handling",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Single CVE, single branch
+  %(prog)s --repo-path /home/user/repos/builder \\
+           --vuln-pkg golang.org/x/net \\
+           --fixed-version v0.38.0 \\
+           --cve-ids CVE-2025-22869 \\
+           --branches 4.16
+
+  # Multiple CVEs, multiple branches with JIRA tickets
+  %(prog)s --repo-path /path/to/repo \\
+           --vuln-pkg golang.org/x/net \\
+           --fixed-version v0.38.0 \\
+           --cve-ids CVE-2025-22869,CVE-2025-22870 \\
+           --branches 4.15,4.16,4.17 \\
+           --ocpbugs 12345,67890
+
+  # Include master branch
+  %(prog)s --repo-path /path/to/repo \\
+           --vuln-pkg golang.org/x/net \\
+           --fixed-version v0.38.0 \\
+           --cve-ids CVE-2025-22869 \\
+           --branches master,4.16,4.17
+        """
+    )
+
+    parser.add_argument(
+        "--repo-path",
+        required=True,
+        help="Path to local Git repository (must have 'upstream' and 'origin' remotes configured)"
+    )
+
+    parser.add_argument(
+        "--vuln-pkg",
+        required=True,
+        help="Vulnerable Go module/package name (e.g., golang.org/x/net)"
+    )
+
+    parser.add_argument(
+        "--fixed-version",
+        required=True,
+        help="Fixed version of the module (e.g., v0.38.0)"
+    )
+
+    parser.add_argument(
+        "--cve-ids",
+        required=True,
+        help="Comma-separated list of CVE IDs (e.g., CVE-2025-22869,CVE-2025-22870)"
+    )
+
+    parser.add_argument(
+        "--branches",
+        required=True,
+        help="Comma-separated list of release versions (e.g., 4.15,4.16,4.17). "
+             "The 'release-' prefix will be added automatically. "
+             "Special branches 'master' and 'main' are kept as-is."
+    )
+
+    parser.add_argument(
+        "--ocpbugs",
+        required=False,
+        default=None,
+        help="Optional comma-separated list of JIRA OCPBUGS IDs to prefix commit messages "
+             "(e.g., 12345,67890 or OCPBUGS-12345,OCPBUGS-67890). "
+             "If provided, commit message will be: 'OCPBUGS-xxxxx,OCPBUGS-yyyyy: <message>'"
+    )
+
+    args = parser.parse_args()
+
+    # Post-process arguments
+    args.repo_path = Path(args.repo_path)
+    args.cve_ids = [cve.strip() for cve in args.cve_ids.split(",")]
+
+    # Convert version numbers to branch names
+    versions = [v.strip() for v in args.branches.split(",")]
+    args.branches = []
+    for version in versions:
+        # Special cases: master, main - keep as-is
+        if version in ("master", "main"):
+            args.branches.append(version)
+        # If user passed "release-X.Y", keep it as-is
+        elif version.startswith("release-"):
+            args.branches.append(version)
+        # Otherwise add "release-" prefix
+        else:
+            args.branches.append(f"release-{version}")
+
+    # Process OCPBUGS IDs if provided
+    if args.ocpbugs:
+        bug_ids = [bug.strip() for bug in args.ocpbugs.split(",")]
+        args.ocpbugs = []
+        for bug_id in bug_ids:
+            # If user passed "OCPBUGS-12345", keep it as-is
+            # Otherwise add "OCPBUGS-" prefix
+            if bug_id.startswith("OCPBUGS-"):
+                args.ocpbugs.append(bug_id)
+            else:
+                args.ocpbugs.append(f"OCPBUGS-{bug_id}")
+    else:
+        args.ocpbugs = None
+
+    return args
+
+
+def main():
+    args = parse_arguments()
+
+    local_path = args.repo_path
+    module = args.vuln_pkg
+    fix_version = args.fixed_version
+    cve_ids = args.cve_ids
+    branches = args.branches
+    ocpbugs = args.ocpbugs
+
+    if not local_path.exists():
+        print(json.dumps({"error": f"Path does not exist: {local_path}"}))
+        sys.exit(1)
+
+    print(f"\n{'='*70}", file=sys.stderr)
+    print(f"REMEDIATION SETUP - Pre-flight checks", file=sys.stderr)
+    print(f"{'='*70}", file=sys.stderr)
+
+    # SETUP STEP 1: Validate git remotes
+    print(f"[INFO] Setup Step 1: Validating git remotes configuration", file=sys.stderr)
+    success, error = validate_git_remotes(local_path)
+    if not success:
+        print(f"[ERROR] Setup Step 1 failed: {error}", file=sys.stderr)
+        print(json.dumps({"error": error}))
+        sys.exit(1)
+    print(f"[SUCCESS] Setup Step 1 complete: Git remotes validated", file=sys.stderr)
+    print(f"  → upstream: configured ✓", file=sys.stderr)
+    print(f"  → origin: configured ✓", file=sys.stderr)
+
+    # SETUP STEP 2: Fetch upstream
+    print(f"[INFO] Setup Step 2: Fetching latest changes from upstream", file=sys.stderr)
+    success, error = fetch_upstream(local_path)
+    if not success:
+        print(f"[ERROR] Setup Step 2 failed: {error}", file=sys.stderr)
+        print(json.dumps({"error": error}))
+        sys.exit(1)
+    print(f"[SUCCESS] Setup Step 2 complete: Upstream fetched successfully", file=sys.stderr)
+
+    # SETUP STEP 3: Get fix version's Go requirement (once for all branches)
+    print(f"[INFO] Setup Step 3: Fetching Go requirement for {module}@{fix_version}", file=sys.stderr)
+    fix_go_required, error = fetch_go_requirement_for_module(module, fix_version)
+    if error:
+        print(f"[ERROR] Setup Step 3 failed: {error}", file=sys.stderr)
+        print(json.dumps({"error": error}))
+        sys.exit(1)
+    print(f"[SUCCESS] Setup Step 3 complete: Fix Go requirement determined", file=sys.stderr)
+    print(f"  → Module: {module}", file=sys.stderr)
+    print(f"  → Fix version: {fix_version}", file=sys.stderr)
+    print(f"  → Requires Go: {fix_go_required}", file=sys.stderr)
+
+    # Derive fork name once (used across all branches if needed)
+    fork_name = derive_fork_name(module)
+    print(f"  → Potential fork name: {fork_name}", file=sys.stderr)
+
+    print(f"\n{'='*70}", file=sys.stderr)
+    print(f"PROCESSING BRANCHES - CVE: {', '.join(cve_ids)}", file=sys.stderr)
+    print(f"{'='*70}", file=sys.stderr)
+    print(f"Branches to process: {', '.join(branches)}", file=sys.stderr)
+    if ocpbugs:
+        print(f"JIRA tickets: {', '.join(ocpbugs)}", file=sys.stderr)
+
+    # GLOBAL LOOP: Process each branch completely before moving to next
+    results = []
+    for branch in branches:
+        branch = branch.strip()
+        print(f"\n{'='*70}", file=sys.stderr)
+        print(f"BRANCH: {branch}", file=sys.stderr)
+        print(f"{'='*70}", file=sys.stderr)
+
+        # ==========================================
+        # STEP 1: Setup branch and configure Go environment
+        # ==========================================
+        print(f"[INFO] Step 1: Setting up branch and configuring Go environment for {branch}", file=sys.stderr)
+        branch_data, error = setup_branch_and_go_environment(local_path, branch, module)
+        if error:
+            print(json.dumps({"error": f"Failed to setup {branch}: {error}"}))
+            sys.exit(1)
+
+        repo_go = branch_data["repo_go_version"]
+        go_source = branch_data.get("go_version_source", "unknown")
+        go_bin = branch_data["go_bin"]
+        working_branch = branch_data['working_branch']
+        base_working_branch = derive_working_branch_name(module, branch)
+
+        print(f"[SUCCESS] Step 1 complete: Branch and Go environment configured", file=sys.stderr)
+        print(f"  → Base branch: {branch}", file=sys.stderr)
+
+        # Show if working branch name was modified for uniqueness
+        if working_branch != base_working_branch:
+            print(f"  → Working branch: {working_branch} (uniquified from {base_working_branch})", file=sys.stderr)
+        else:
+            print(f"  → Working branch: {working_branch}", file=sys.stderr)
+
+        print(f"  → Go version detected: {repo_go} (source: {go_source})", file=sys.stderr)
+        print(f"  → Go version installed and set: {repo_go}", file=sys.stderr)
+
+        # ==========================================
+        # STEP 2: Check compatibility and determine if fork is needed
+        # ==========================================
+        print(f"[INFO] Step 2: Checking Go version compatibility", file=sys.stderr)
+        comparison = compare_versions(fix_go_required, repo_go)
+        branch_needs_fork = comparison > 0
+
+        print(f"[SUCCESS] Step 2 complete: Compatibility check done", file=sys.stderr)
+        print(f"  → Fix requires Go: {fix_go_required}", file=sys.stderr)
+        print(f"  → Repository has Go: {repo_go}", file=sys.stderr)
+        print(f"  → Fork needed: {'Yes' if branch_needs_fork else 'No (direct fix possible)'}", file=sys.stderr)
+
+        fork_info = None
+        status = None
+        details = {}
+
+        if branch_needs_fork:
+            # ==========================================
+            # STEP 3: Fork lookup and selection
+            # ==========================================
+            print(f"[INFO] Step 3: Looking up openshift-sustaining fork", file=sys.stderr)
+            fork_exists, fork_check_error = check_if_fork_exists(fork_name)
+
+            if not fork_exists:
+                print(f"[ERROR] Step 3 failed: Fork repository does not exist", file=sys.stderr)
+                print(f"  → Fork name: {fork_name}", file=sys.stderr)
+                print(f"  → Error: {fork_check_error}", file=sys.stderr)
+                status = "BLOCKED"
+                details = {
+                    "method": None,
+                    "reason": fork_check_error or "Fork repository not available"
+                }
+            else:
+                print(f"[SUCCESS] Step 3a: Fork repository exists", file=sys.stderr)
+                print(f"  → Fork: openshift-sustaining/{fork_name}", file=sys.stderr)
+
+                print(f"[INFO] Step 3b: Finding best fork release for Go {repo_go}", file=sys.stderr)
+                # Find best fork release for this branch's Go version
+                fork_version, error = find_best_fork_release(
+                    fork_name, cve_ids, fix_version, repo_go
+                )
+                if error:
+                    print(f"[ERROR] Step 3b failed: {error}", file=sys.stderr)
+                    status = "BLOCKED"
+                    details = {
+                        "method": None,
+                        "reason": f"Fork selection failed: {error}"
+                    }
+                else:
+                    print(f"[SUCCESS] Step 3b complete: Fork release selected", file=sys.stderr)
+                    print(f"  → Selected version: {fork_version}", file=sys.stderr)
+
+                    print(f"[INFO] Step 3c: Fetching fork Go requirement", file=sys.stderr)
+                    # Get fork's Go requirement
+                    fork_go_required, error = fetch_fork_go_requirement(fork_name, fork_version)
+                    if error:
+                        print(f"[ERROR] Step 3c failed: {error}", file=sys.stderr)
+                        status = "BLOCKED"
+                        details = {
+                            "method": None,
+                            "reason": f"Failed to determine fork Go requirement: {error}"
+                        }
+                    else:
+                        print(f"[SUCCESS] Step 3c complete: Fork Go requirement determined", file=sys.stderr)
+                        print(f"  → Fork requires Go: {fork_go_required}", file=sys.stderr)
+
+                        fork_info = {
+                            "name": fork_name,
+                            "version": fork_version,
+                            "go_required": fork_go_required
+                        }
+                        # Determine compatibility with this fork
+                        status, details = determine_branch_compatibility(repo_go, fix_go_required, fork_info)
+                        print(f"[SUCCESS] Step 3 complete: Fork compatibility determined", file=sys.stderr)
+                        print(f"  → Status: {status}", file=sys.stderr)
+                        print(f"  → Method: {details.get('method')}", file=sys.stderr)
+                        print(f"  → Reason: {details.get('reason')}", file=sys.stderr)
+        else:
+            # Direct fix is compatible
+            print(f"[SUCCESS] Step 3 complete: Direct fix is compatible (no fork needed)", file=sys.stderr)
+            status = "COMPATIBLE"
+            details = {
+                "method": "get",
+                "reason": f"Fix requires Go {fix_go_required}, repo has {repo_go}"
+            }
+            print(f"  → Method: go get", file=sys.stderr)
+
+        # Update branch data with compatibility info
+        branch_data.update({
+            "compatibility": status,
+            **details
+        })
+
+        if fork_info:
+            branch_data["fork"] = fork_info
+
+        # ==========================================
+        # STEP 4: Apply fix if not blocked
+        # ==========================================
+        if status != "BLOCKED":
+            print(f"[INFO] Step 4: Applying fix using method: {details['method']}", file=sys.stderr)
+
+            # Checkout this branch's working branch
+            success, _, stderr = run(f"git checkout {branch_data['working_branch']}", local_path)
+            if not success:
+                branch_data["error"] = f"Failed to checkout {branch_data['working_branch']}: {stderr}"
+                results.append(branch_data)
+                continue
+
+            method = details["method"]
+
+            # Apply fix
+            if method == "get":
+                success, error = apply_go_get(local_path, module, fix_version, go_bin)
+                if not success:
+                    print(f"[ERROR] Step 4 failed: {error}", file=sys.stderr)
+                    branch_data["error"] = error
+                    results.append(branch_data)
+                    continue
+
+                version_used = fix_version
+                fork_name_used = None
+                print(f"[SUCCESS] Step 4 complete: Applied go get successfully", file=sys.stderr)
+                print(f"  → Command: go get {module}@{fix_version}", file=sys.stderr)
+
+            elif method == "replace":
+                fork_version = details["fork_version"]
+                fork_name_used = fork_info["name"]
+                success, error = apply_go_replace(local_path, module, fork_name_used, fork_version)
+                if not success:
+                    print(f"[ERROR] Step 4 failed: {error}", file=sys.stderr)
+                    branch_data["error"] = error
+                    results.append(branch_data)
+                    continue
+
+                version_used = fork_version
+                print(f"[SUCCESS] Step 4 complete: Applied go mod replace successfully", file=sys.stderr)
+                print(f"  → Replaced: {module}", file=sys.stderr)
+                print(f"  → With fork: github.com/openshift-sustaining/{fork_name_used}@{fork_version}", file=sys.stderr)
+
+            # ==========================================
+            # STEP 5: Run go mod tidy and vendor
+            # ==========================================
+            print(f"[INFO] Step 5: Running go mod tidy and go mod vendor", file=sys.stderr)
+            success, has_vendor, error = run_go_tidy_and_vendor(local_path, go_bin)
+            if not success:
+                print(f"[ERROR] Step 5 failed: {error}", file=sys.stderr)
+                branch_data["error"] = error
+                results.append(branch_data)
+                continue
+
+            print(f"[SUCCESS] Step 5 complete: Dependencies updated", file=sys.stderr)
+            print(f"  → go mod tidy: ✓", file=sys.stderr)
+            print(f"  → go mod vendor: {'✓' if has_vendor else 'N/A (no vendor/ directory)'}", file=sys.stderr)
+
+            # ==========================================
+            # STEP 6: Create commit
+            # ==========================================
+            print(f"[INFO] Step 6: Creating Git commit", file=sys.stderr)
+            commit_msg = build_commit_message(module, version_used, cve_ids, method, fork_name_used, ocpbugs)
+            commit_hash, error = commit_changes(local_path, commit_msg, has_vendor)
+            if error:
+                print(f"[ERROR] Step 6 failed: {error}", file=sys.stderr)
+                branch_data["error"] = error
+                results.append(branch_data)
+                continue
+
+            branch_data["commit"] = commit_hash
+            branch_data["commit_message"] = commit_msg
+            print(f"[SUCCESS] Step 6 complete: Commit created", file=sys.stderr)
+            print(f"  → Commit hash: {commit_hash}", file=sys.stderr)
+            print(f"  → Message: {commit_msg}", file=sys.stderr)
+        else:
+            print(f"[BLOCKED] Cannot proceed: {details.get('reason')}", file=sys.stderr)
+
+        results.append(branch_data)
+        print(f"\n{'='*70}", file=sys.stderr)
+        print(f"BRANCH {branch} COMPLETE", file=sys.stderr)
+        print(f"{'='*70}\n", file=sys.stderr)
+
+    # Output final results
+    output = {
+        "success": True,
+        "module": module,
+        "fix_version": fix_version,
+        "fix_go_required": fix_go_required,
+        "cve_ids": cve_ids,
+        "branches": results
+    }
+
+    print(json.dumps(output, indent=2))
+
+
+if __name__ == "__main__":
+    main()
