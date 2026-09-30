@@ -138,14 +138,20 @@ Set these environment variables before using the script:
 # GitHub Personal Access Token (required for clone/fork operations)
 export GITHUB_TOKEN=ghp_xxxxxxxxxxxxx
 
-# Your GitHub username/organization (required for fork creation)
-export GITHUB_ORG=your-github-username
+# GitHub organization or username for fork creation (optional, defaults to openshift-sustaining)
+export GITHUB_ORG=openshift-sustaining
 ```
 
 **Creating a GitHub Token:**
 1. Go to https://github.com/settings/tokens
 2. Generate new token (classic)
 3. Required scopes: `repo`, `workflow`
+
+**Fork Behavior:**
+- **GITHUB_ORG not set or set to `openshift-sustaining`**: Creates org fork with naming convention
+  - Example: `openshift/hypershift` → `openshift-sustaining/openshift--hypershift`
+- **GITHUB_ORG set to personal username** (e.g., `sunku5494`): Creates personal fork
+  - Example: `openshift/hypershift` → `sunku5494/hypershift`
 
 ## Command-Line Arguments
 
@@ -163,6 +169,13 @@ export GITHUB_ORG=your-github-username
 
 ### 1. Setup Environment (One-Time)
 
+**For OpenShift Sustaining (Default):**
+```bash
+export GITHUB_TOKEN=ghp_xxxxxxxxxxxxx
+# GITHUB_ORG not set = defaults to openshift-sustaining
+```
+
+**For Personal Fork:**
 ```bash
 export GITHUB_TOKEN=ghp_xxxxxxxxxxxxx
 export GITHUB_ORG=sunku5494
@@ -173,13 +186,15 @@ export GITHUB_ORG=sunku5494
 Clone repository, create fork, configure remotes:
 
 ```bash
-./groc.py --repo github.com/openshift/baremetal-runtimecfg
+./groc.py --repo github.com/openshift/hypershift
 ```
 
-**Output:**
-- ✅ Creates fork in your GitHub account (if doesn't exist)
-- ✅ Clones repository to `./baremetal-runtimecfg`
-- ✅ Configures `upstream` and `origin` remotes
+**Output (for openshift-sustaining):**
+- ✅ Creates fork at `openshift-sustaining/openshift--hypershift` (if doesn't exist)
+- ✅ Clones FROM org fork to `./hypershift`
+- ✅ Configures remotes:
+  - `origin` → `openshift-sustaining/openshift--hypershift` (push here)
+  - `upstream` → `openshift/hypershift` (read-only)
 - ✅ Enables upstream push protection
 
 ### 3. Full CVE Remediation
@@ -204,18 +219,46 @@ Apply CVE fix across multiple branches and create commits:
 
 ## Usage Examples
 
-### Repository Setup Only
+### OpenShift Sustaining Org Fork (Default)
 
-Set up a repository for later CVE remediation:
+Create fork in openshift-sustaining organization and apply CVE fixes:
 
 ```bash
-# Setup environment
+# Setup environment (GITHUB_ORG defaults to openshift-sustaining if not set)
+export GITHUB_TOKEN=ghp_xxxxxxxxxxxxx
+
+# Create org fork and apply fixes
+./groc.py \
+  --repo github.com/openshift/hypershift \
+  --vuln-pkg golang.org/x/net \
+  --fixed-version v0.38.0 \
+  --cve-ids CVE-2025-22869 \
+  --branches 4.15,4.16,4.17
+```
+
+**What happens:**
+- ✅ Fork created at `openshift-sustaining/openshift--hypershift`
+- ✅ Clones from org fork (not upstream)
+- ✅ Remotes configured: `origin` → org fork, `upstream` → original repo
+- ✅ Commits created on working branches
+
+### Personal Fork
+
+Create fork in your personal GitHub account:
+
+```bash
+# Setup environment for personal fork
 export GITHUB_TOKEN=ghp_xxxxxxxxxxxxx
 export GITHUB_ORG=sunku5494
 
 # Clone, fork, and configure
-./groc.py --repo github.com/openshift/baremetal-runtimecfg
+./groc.py --repo github.com/openshift/hypershift
 ```
+
+**What happens:**
+- ✅ Fork created at `sunku5494/hypershift`
+- ✅ Clones from personal fork
+- ✅ Remotes configured: `origin` → personal fork, `upstream` → original repo
 
 ### Local Repository - Single Branch
 
