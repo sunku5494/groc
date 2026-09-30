@@ -352,7 +352,7 @@ def setup_git_remotes(repo_path, upstream_url, fork_url):
 
         remotes_skipped.append('upstream')
 
-    # Check and add origin remote
+    # Check and add/update origin remote
     if 'origin' not in remotes:
         print(f"[ACTION] Adding origin remote: {fork_clone_url}", file=sys.stderr)
         success, _, stderr = run(f"git remote add origin {fork_clone_url}", repo_path)
@@ -360,8 +360,34 @@ def setup_git_remotes(repo_path, upstream_url, fork_url):
             return False, f"Failed to add origin remote: {stderr}"
         remotes_added.append('origin')
     else:
-        print(f"[SKIP] Origin remote already configured", file=sys.stderr)
-        remotes_skipped.append('origin')
+        # Origin exists - verify it points to the correct fork
+        success, current_origin, _ = run("git remote get-url origin", repo_path)
+        if success:
+            current_origin = current_origin.strip()
+
+            # Normalize URLs for comparison (remove .git suffix, https/git@ prefix)
+            def normalize_url(url):
+                url = url.replace('https://', '').replace('http://', '').replace('git@', '').replace(':', '/')
+                if url.endswith('.git'):
+                    url = url[:-4]
+                return url.lower()
+
+            expected_normalized = normalize_url(fork_clone_url)
+            current_normalized = normalize_url(current_origin)
+
+            if current_normalized != expected_normalized:
+                # Mismatch - update origin to correct fork
+                print(f"[ACTION] Updating origin remote from {current_origin} to {fork_clone_url}", file=sys.stderr)
+                success, _, stderr = run(f"git remote set-url origin {fork_clone_url}", repo_path)
+                if not success:
+                    return False, f"Failed to update origin remote: {stderr}"
+                remotes_added.append('origin (updated)')
+            else:
+                print(f"[SKIP] Origin remote already points to correct fork", file=sys.stderr)
+                remotes_skipped.append('origin')
+        else:
+            print(f"[SKIP] Origin remote already configured", file=sys.stderr)
+            remotes_skipped.append('origin')
 
     # Summary
     if remotes_added:
@@ -1368,6 +1394,39 @@ def main():
         if not local_path.exists():
             print(json.dumps({"error": f"Path does not exist: {local_path}"}))
             sys.exit(1)
+
+        # For local repos, verify and update remotes if needed
+        # Extract upstream URL from git remotes to determine fork URL
+        success, remotes_output, _ = run("git remote -v", local_path)
+        if success and 'upstream' in remotes_output.lower():
+            # Parse upstream URL
+            for line in remotes_output.split('\n'):
+                if line.strip().lower().startswith('upstream') and 'fetch' in line.lower():
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        upstream_url = parts[1]
+
+                        # Extract org and repo name from upstream URL
+                        org, repo_name, clean_url = extract_repo_info_from_url(upstream_url)
+
+                        if org and repo_name:
+                            # Check GitHub auth to get github_org
+                            github_org_temp, error = check_github_auth()
+                            if not error and github_org_temp:
+                                # Determine expected fork URL based on GITHUB_ORG
+                                is_sustaining_org = (github_org_temp == "openshift-sustaining")
+                                if is_sustaining_org:
+                                    fork_repo_name = f"{org}--{repo_name}"
+                                    fork_url = f"github.com/{github_org_temp}/{fork_repo_name}"
+                                else:
+                                    fork_url = f"github.com/{github_org_temp}/{repo_name}"
+
+                                # Verify and update remotes
+                                print(f"[INFO] Verifying git remotes configuration", file=sys.stderr)
+                                success, error = setup_git_remotes(local_path, clean_url, fork_url)
+                                if error:
+                                    print(f"[WARNING] Failed to update remotes: {error}", file=sys.stderr)
+                        break
 
     # ============================================================================
     # CHECK IF SETUP-ONLY MODE
