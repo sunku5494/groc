@@ -159,14 +159,14 @@ def check_github_auth():
 
     Required:
       - GITHUB_TOKEN: For authentication
-      - GITHUB_ORG: Your GitHub username/organization for fork creation
+      - GITHUB_ORG: GitHub username/organization (defaults to 'openshift-sustaining')
 
     Returns: (github_org, error)
-      - github_org: The GitHub username/org from GITHUB_ORG env var
+      - github_org: The GitHub username/org (defaults to 'openshift-sustaining')
       - error: Error message if setup is incomplete
     """
     github_token = os.getenv("GITHUB_TOKEN")
-    github_org = os.getenv("GITHUB_ORG")
+    github_org = os.getenv("GITHUB_ORG") or "openshift-sustaining"  # Default to openshift-sustaining if not set or empty
 
     errors = []
 
@@ -175,13 +175,6 @@ def check_github_auth():
             "GITHUB_TOKEN environment variable not set.\n"
             "  Set it with: export GITHUB_TOKEN=ghp_xxxxxxxxxxxxx\n"
             "  Create token at: https://github.com/settings/tokens"
-        )
-
-    if not github_org:
-        errors.append(
-            "GITHUB_ORG environment variable not set.\n"
-            "  Set it with: export GITHUB_ORG=your-github-username\n"
-            "  This is your GitHub username where forks will be created."
         )
 
     if errors:
@@ -200,33 +193,55 @@ def check_github_auth():
     return github_org, None
 
 
-def ensure_fork_exists(upstream_org, repo_name, github_user):
+def ensure_fork_exists(upstream_org, repo_name, github_org):
     """
     Check if fork exists, create if missing.
 
-    Steps:
-      1. Run: gh repo view {github_user}/{repo_name}
-      2. If exists: return fork_url, False
-      3. If not exists:
-         - Run: gh repo fork {upstream_org}/{repo_name} --clone=false
-         - Return fork_url, True
+    Args:
+        upstream_org: Original repository organization (e.g., 'openshift')
+        repo_name: Repository name (e.g., 'hypershift')
+        github_org: GitHub username or organization (e.g., 'openshift-sustaining' or 'sunku5494')
+
+    Fork Naming Convention:
+        - For 'openshift-sustaining': {upstream_org}--{repo_name}
+          Example: openshift/hypershift -> openshift-sustaining/openshift--hypershift
+        - For personal accounts: {repo_name}
+          Example: openshift/hypershift -> sunku5494/hypershift
 
     Returns: (fork_url, was_created, error)
     """
-    fork_url = f"github.com/{github_user}/{repo_name}"
+    # Detect if this is openshift-sustaining org (use naming convention)
+    is_sustaining_org = (github_org == "openshift-sustaining")
+
+    if is_sustaining_org:
+        # Organization fork with naming convention
+        fork_repo_name = f"{upstream_org}--{repo_name}"
+        fork_url = f"github.com/{github_org}/{fork_repo_name}"
+        check_cmd = f"gh repo view {github_org}/{fork_repo_name}"
+        target_desc = f"{github_org} organization"
+    else:
+        # Personal fork
+        fork_repo_name = repo_name
+        fork_url = f"github.com/{github_org}/{repo_name}"
+        check_cmd = f"gh repo view {github_org}/{repo_name}"
+        target_desc = f"{github_org}'s account"
 
     # Check if fork already exists
-    check_cmd = f"gh repo view {github_user}/{repo_name}"
     success, _, _ = run(check_cmd)
 
     if success:
-        print(f"[SKIP] Fork already exists in GitHub account: {fork_url}", file=sys.stderr)
+        print(f"[SKIP] Fork already exists: {fork_url}", file=sys.stderr)
         print(f"       No action needed - using existing fork", file=sys.stderr)
         return fork_url, False, None
 
     # Fork doesn't exist, create it
-    print(f"[ACTION] Creating fork of {upstream_org}/{repo_name} in {github_user}'s account...", file=sys.stderr)
-    fork_cmd = f"gh repo fork {upstream_org}/{repo_name} --clone=false"
+    print(f"[ACTION] Creating fork of {upstream_org}/{repo_name} in {target_desc}...", file=sys.stderr)
+
+    if is_sustaining_org:
+        fork_cmd = f"gh repo fork {upstream_org}/{repo_name} --org {github_org} --clone=false"
+    else:
+        fork_cmd = f"gh repo fork {upstream_org}/{repo_name} --clone=false"
+
     success, stdout, stderr = run(fork_cmd)
 
     if not success:
@@ -236,21 +251,24 @@ def ensure_fork_exists(upstream_org, repo_name, github_user):
     return fork_url, True, None
 
 
-def clone_repository(upstream_url, repo_name):
+def clone_repository(upstream_url, repo_name, fork_url=None):
     """
-    Clone repository from upstream URL to current directory (idempotent).
+    Clone repository to current directory (idempotent).
 
-    Steps:
-      1. Derive dest_path: {pwd}/{repo_name} (e.g., ./installer)
-      2. Check if dest_path already exists
-         - If exists: return (dest_path, was_cloned=False, error=None)
-         - If not exists: proceed to clone
-      3. Run: git clone {upstream_url} {dest_path}
-      4. Verify clone success
+    Args:
+        upstream_url: Original repository URL (for reference)
+        repo_name: Simple repository name for local directory (e.g., 'hypershift')
+        fork_url: Optional fork URL to clone from instead of upstream
+                  (e.g., 'github.com/openshift-sustaining/openshift--hypershift')
+
+    When fork_url is provided:
+      - Clones FROM the fork (not upstream)
+      - Local directory uses simple repo_name (e.g., ./hypershift)
+      - origin remote will point to fork after clone
 
     Returns: (local_path, was_cloned, error)
     """
-    # Derive destination path in current directory
+    # Derive destination path in current directory (always use simple repo_name)
     dest_path = Path.cwd() / repo_name
 
     # Check if already cloned
@@ -259,13 +277,16 @@ def clone_repository(upstream_url, repo_name):
         print(f"       No action needed - using existing clone", file=sys.stderr)
         return dest_path, False, None
 
+    # Determine clone source: fork if provided, otherwise upstream
+    clone_source = fork_url if fork_url else upstream_url
+
     # Clone the repository
-    print(f"[ACTION] Cloning {upstream_url} to {dest_path}...", file=sys.stderr)
+    print(f"[ACTION] Cloning from {clone_source} to {dest_path}...", file=sys.stderr)
 
     # Ensure we use https:// prefix for git clone
-    clone_url = upstream_url
+    clone_url = clone_source
     if not clone_url.startswith(('http://', 'https://', 'git@')):
-        clone_url = f"https://{upstream_url}"
+        clone_url = f"https://{clone_source}"
 
     clone_cmd = f"git clone {clone_url} {dest_path}"
     success, stdout, stderr = run(clone_cmd)
@@ -1093,15 +1114,15 @@ def parse_arguments():
         epilog="""
 Environment Variables:
   GITHUB_TOKEN    GitHub personal access token (required for clone mode)
-  GITHUB_ORG      Your GitHub username/organization (required for clone mode)
+  GITHUB_ORG      GitHub username/organization (defaults to 'openshift-sustaining')
+                  Set to personal username for personal forks (e.g., sunku5494)
 
 Examples:
-  # Setup environment (one-time)
+  # Setup environment (one-time) - defaults to openshift-sustaining
   export GITHUB_TOKEN=ghp_xxxxxxxxxxxxx
-  export GITHUB_ORG=sunku5494
 
-  # Repository setup only (clone, fork, configure remotes)
-  %(prog)s --repo github.com/openshift/baremetal-runtimecfg
+  # Repository setup only (clone org fork, configure remotes)
+  %(prog)s --repo github.com/openshift/hypershift
 
   # Local repository (existing behavior)
   %(prog)s --repo /home/user/repos/builder \\
@@ -1280,9 +1301,6 @@ def main():
             print(json.dumps({"error": error}))
             sys.exit(1)
 
-        # Derive fork URL
-        fork_url = f"github.com/{github_org}/{repo_info['repo_name']}"
-
         # Ensure fork exists (idempotent)
         fork_url, fork_created, error = ensure_fork_exists(
             repo_info['org'],
@@ -1299,10 +1317,11 @@ def main():
         else:
             actions_skipped.append(f"Fork already exists: {fork_url}")
 
-        # Clone repository (idempotent - skips if exists)
+        # Clone repository from fork (idempotent - skips if exists)
         local_path, was_cloned, error = clone_repository(
             repo_info['upstream_url'],
-            repo_info['repo_name']
+            repo_info['repo_name'],
+            fork_url=fork_url  # Clone from fork, not upstream
         )
         if error:
             print(f"[ERROR] Clone failed", file=sys.stderr)
