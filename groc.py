@@ -926,6 +926,148 @@ def find_best_fork_release(fork_name, cve_ids, fix_version, repo_go_version):
     return None, f"No fork release found covering all CVE IDs: {', '.join(cve_ids)}"
 
 
+def find_latest_fork_security_release(fork_name, cve_ids, fix_version, repo_go_version):
+    """
+    Find the LATEST security patch for the base version where CVE was fixed.
+    
+    Algorithm:
+    1. Filter releases to compatible Go versions (repo Go version or older)
+    2. Find the CVE in any compatible release → extract base version + Go version
+    3. Find ALL security patches for that base version + Go version
+    4. Return the LATEST sec patch (highest published_at)
+    
+    Example:
+      Repo needs Go 1.24
+      CVE found in v0.48.0-sec.1 (Go 1.24)
+      Available: v0.48.0-sec.1, sec.2, sec.3, sec.4, sec.5 (all Go 1.24)
+      → Returns v0.48.0-sec.5 (latest cumulative patch)
+
+    Returns (tag, None) on success or (None, error) on failure.
+    """
+    url = f"https://api.github.com/repos/openshift-sustaining/{fork_name}/releases?per_page=100"
+    success, stdout, stderr = run(f'curl -s "{url}"')
+
+    if not success:
+        return None, f"Failed to fetch fork releases: {stderr}"
+
+    try:
+        releases = json.loads(stdout)
+    except json.JSONDecodeError as e:
+        return None, f"Failed to parse releases JSON: {e}"
+
+    if not releases or not isinstance(releases, list):
+        return None, "No releases found for fork"
+
+    repo_go_parts = repo_go_version.split(".")[:2]
+    repo_go_major_minor = ".".join(repo_go_parts)
+    repo_version_tuple = tuple(int(x) for x in repo_go_parts)
+
+    print(
+        f"[debug] find_latest_fork_security_release: fork={fork_name} "
+        f"cve_ids={cve_ids} repo_go={repo_go_major_minor} "
+        f"releases_fetched={len(releases)}",
+        file=sys.stderr,
+    )
+
+    # Step 1: Filter releases to compatible Go versions and find CVE
+    cve_found_release = None
+    
+    for release in releases:
+        tag = release.get("tag_name", "")
+        name = release.get("name", "")
+        
+        # Extract Go version
+        go_version = extract_go_version_from_name(name)
+        if not go_version:
+            continue
+        
+        go_version_parts = go_version.split(".")[:2]
+        go_version_normalized = ".".join(go_version_parts)
+        go_ver_tuple = tuple(int(x) for x in go_version_parts)
+        
+        # Check Go version compatibility (same or older)
+        if go_ver_tuple > repo_version_tuple:
+            continue
+        
+        # Check if this release mentions the CVE
+        name_normalized = name.replace("-", " ").replace("  ", " ")
+        for cve in cve_ids:
+            cve_normalized = cve.replace("-", " ")
+            if cve_normalized in name_normalized:
+                cve_found_release = {
+                    "tag": tag,
+                    "name": name,
+                    "go_version": go_version_normalized
+                }
+                print(
+                    f"[debug] CVE found in compatible release: {tag} (Go {go_version_normalized})",
+                    file=sys.stderr,
+                )
+                break
+        
+        if cve_found_release:
+            break
+    
+    if not cve_found_release:
+        return None, f"No compatible fork release found for CVE(s): {', '.join(cve_ids)} (Go {repo_go_major_minor} or older)"
+    
+    # Step 2: Extract base version from the tag where CVE was found
+    tag_with_fix = cve_found_release["tag"]
+    base_version_match = re.match(r'^(v[\d.]+)-sec', tag_with_fix)
+    if not base_version_match:
+        return None, f"Could not extract base version from tag: {tag_with_fix}"
+    
+    base_version = base_version_match.group(1)
+    target_go_version = cve_found_release["go_version"]
+    
+    print(
+        f"[debug] Target: base={base_version} go={target_go_version}",
+        file=sys.stderr,
+    )
+    
+    # Step 3: Find ALL security patches for this base version + Go version
+    matching_releases = []
+    
+    for release in releases:
+        tag = release.get("tag_name", "")
+        name = release.get("name", "")
+        published_at = release.get("published_at", "")
+        
+        # Check if tag matches base version pattern
+        if not tag.startswith(base_version + "-sec"):
+            continue
+        
+        # Check if Go version matches
+        go_version = extract_go_version_from_name(name)
+        if not go_version:
+            continue
+        
+        go_version_normalized = ".".join(go_version.split(".")[:2])
+        if go_version_normalized != target_go_version:
+            continue
+        
+        matching_releases.append({
+            "tag": tag,
+            "name": name,
+            "published_at": published_at
+        })
+    
+    if not matching_releases:
+        return None, f"No releases found for {base_version} with Go {target_go_version}"
+    
+    # Step 4: Sort by published date and return the LATEST
+    matching_releases.sort(key=lambda x: x["published_at"], reverse=True)
+    latest = matching_releases[0]
+    
+    print(
+        f"[INFO] Selected LATEST security patch: {latest['tag']} "
+        f"({base_version}, Go {target_go_version}, {len(matching_releases)} total patches)",
+        file=sys.stderr,
+    )
+    
+    return latest["tag"], None
+
+
 def fetch_fork_go_requirement(fork_name, fork_version):
     """Get Go version required by fork@version."""
     # Try module proxy first
@@ -1243,6 +1385,14 @@ Examples:
         help="Create separate commits for vendor/ changes and go.mod/go.sum changes. "
              "If enabled, creates two commits: first for vendor/ (titled 'Vendor Changes'), "
              "then for go.mod/go.sum (titled 'go.mod Changes')"
+    )
+
+    parser.add_argument(
+        "--min-fork-version",
+        action="store_true",
+        help="Select minimum (earliest) fork version with CVE fixes. "
+             "Default: selects LATEST security patch for maximum cumulative fixes. "
+             "With this flag: selects EARLIEST fork release (legacy behavior)."
     )
 
     args = parser.parse_args()
@@ -1585,11 +1735,17 @@ def main():
                 print(f"[SUCCESS] Step 3a: Fork repository exists", file=sys.stderr)
                 print(f"  → Fork: openshift-sustaining/{fork_name}", file=sys.stderr)
 
-                print(f"[INFO] Step 3b: Finding best fork release for Go {repo_go}", file=sys.stderr)
-                # Find best fork release for this branch's Go version
-                fork_version, error = find_best_fork_release(
-                    fork_name, cve_ids, fix_version, repo_go
-                )
+                # Select fork version based on algorithm choice
+                if args.min_fork_version:
+                    print(f"[INFO] Step 3b: Finding earliest fork release for Go {repo_go} (--min-fork-version)", file=sys.stderr)
+                    fork_version, error = find_best_fork_release(
+                        fork_name, cve_ids, fix_version, repo_go
+                    )
+                else:
+                    print(f"[INFO] Step 3b: Finding latest security patch fork release for Go {repo_go}", file=sys.stderr)
+                    fork_version, error = find_latest_fork_security_release(
+                        fork_name, cve_ids, fix_version, repo_go
+                    )
                 if error:
                     print(f"[ERROR] Step 3b failed: {error}", file=sys.stderr)
                     status = "BLOCKED"
