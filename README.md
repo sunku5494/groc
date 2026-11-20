@@ -164,6 +164,7 @@ export GITHUB_ORG=openshift-sustaining
 | `--branches` | No* | Comma-separated release versions (e.g., `4.15,4.16,4.17`) |
 | `--ocpbugs` | No | Comma-separated JIRA OCPBUGS IDs for commit message prefix |
 | `--separate-vendor-commits` | No | Create separate commits for vendor/ and go.mod/go.sum |
+| `--min-fork-version` | No | Use earliest fork version instead of latest security patch (default: latest) |
 
 ## Quick Start
 
@@ -322,10 +323,52 @@ Apply fix to master along with release branches:
   --branches master,4.16,4.17
 ```
 
+### Fork Version Selection
+
+**Default (Latest Security Patch - Recommended):**
+
+```bash
+./groc.py \
+  --repo github.com/openshift/installer \
+  --vuln-pkg golang.org/x/net \
+  --fixed-version v0.43.0 \
+  --cve-ids CVE-2026-1234 \
+  --branches 4.16
+```
+
+**Result:** Selects LATEST openshift-sustaining fork security patch (e.g., `v0.43.0-sec.5-go1.22` if sec.5 is newest)
+
+**Benefits:**
+- ✅ Gets all cumulative security fixes (sec.1 through sec.5)
+- ✅ Maximum protection with latest patches
+- ✅ Recommended for production use
+
+**Minimum Fork Version (Legacy):**
+
+```bash
+./groc.py \
+  --repo github.com/openshift/installer \
+  --vuln-pkg golang.org/x/net \
+  --fixed-version v0.43.0 \
+  --cve-ids CVE-2026-1234 \
+  --branches 4.16 \
+  --min-fork-version
+```
+
+**Result:** Selects EARLIEST fork release where CVE was fixed (e.g., `v0.43.0-sec.1-go1.22`)
+
+**Use case:**
+- Minimal version bump
+- Legacy compatibility testing
+- Matching specific historical fix version
+
 ## Best Practices
 
 1. **Set environment variables in your shell profile** (`.bashrc`, `.zshrc`) for permanent setup
 2. **Always review changes** before pushing to your fork
 3. **Test in a single branch** before running on multiple branches
 4. **Use `--separate-vendor-commits`** for easier PR review
+5. **Fork version selection:**
+   - **Default (latest patch)**: Gets most recent security patches and cumulative fixes - recommended for production
+   - **`--min-fork-version`**: Use only when you need minimal version bump or legacy compatibility
    
